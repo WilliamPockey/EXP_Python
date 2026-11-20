@@ -176,6 +176,8 @@ def check_assessments(
 
 
 class OptimizedVerifier:
+    extraction_prompt = EXTRACT_PROMPT
+
     def __init__(self, client: OllamaClient) -> None:
         self.client = client
         self.extraction_schema = CLAIM_LIST.json_schema()
@@ -184,26 +186,32 @@ class OptimizedVerifier:
     def last_run(self) -> ModelRun | None:
         return self.client.last_run
 
-    def verify(self, request: VerifyRequest) -> object:
-        run = self.client.start_run()
-        answer_sentences = {
+    def segment(self, answer: str, run: ModelRun) -> dict[str, str]:
+        return {
             str(index): sentence
             for index, sentence in enumerate(
                 piece
-                for original in sentences(request.generated_answer)
+                for original in sentences(answer)
                 if not original.endswith("?") and not NONFACTUAL.match(original)
                 for piece in split_coordinated_predicates(original)
             )
         }
-        if not answer_sentences:
-            return {"claims": []}
 
+    def extract(self, answer_sentences: dict[str, str], run: ModelRun) -> dict[str, str]:
         answer = json.dumps(answer_sentences, ensure_ascii=False)
         sentence_ids = list(answer_sentences)
         extraction = self.client.generate(
-            f"{EXTRACT_PROMPT}\n\nInput JSON:\n{answer}", indexed_schema(sentence_ids, self.extraction_schema), run
+            f"{self.extraction_prompt}\n\nInput JSON:\n{answer}", indexed_schema(sentence_ids, self.extraction_schema), run
         )
-        claims = extract_claims(extraction, sentence_ids)
+        return extract_claims(extraction, sentence_ids)
+
+    def verify(self, request: VerifyRequest) -> object:
+        run = self.client.start_run()
+        answer_sentences = self.segment(request.generated_answer, run)
+        if not answer_sentences:
+            return {"claims": []}
+
+        claims = self.extract(answer_sentences, run)
         if not claims:
             return {"claims": []}
         passages = request.context_passages
@@ -213,20 +221,7 @@ class OptimizedVerifier:
                 for text in claims.values()
             ]}
 
-        sources = dict(enumerate(passages))
-        source_words = [(index, content_words(passage)) for index, passage in sources.items()]
-        hints = {}
-        for claim_id, claim_text in claims.items():
-            words = content_words(claim_text)
-            ranked = sorted(source_words, key=lambda source: -token_overlap(words, source[1]))
-            hints[claim_id] = [index for index, _ in ranked[:2]]
-        batch = {"claims": claims, "likely_relevant_passage_ids": hints, "passages": sources}
-        prompt = VERIFY_PROMPT + "\n\nInput JSON:\n" + json.dumps(batch, ensure_ascii=False)
-        payload = self.client.generate(prompt, indexed_schema(list(claims), Assessment.model_json_schema()), run)
-        if isinstance(payload, dict):
-            run.raw_quotes = count_raw_quotes({"claims": list(payload.values())}, passages)
-        accepted, rejected = check_assessments(payload, claims, passages)
-
+        accepted, rejected = self.assess(claims, passages, run)
         if rejected:
             run.repair_attempted = True
             pending = {claim_id: claims[claim_id] for claim_id in rejected}
@@ -234,6 +229,26 @@ class OptimizedVerifier:
             run.repair_succeeded = True
 
         return {"claims": [accepted[claim_id].model_dump() for claim_id in claims]}
+
+    def passage_inputs(self, claims: dict[str, str], passages: list[str]) -> dict:
+        sources = dict(enumerate(passages))
+        source_words = [(index, content_words(passage)) for index, passage in sources.items()]
+        hints = {}
+        for claim_id, claim_text in claims.items():
+            words = content_words(claim_text)
+            ranked = sorted(source_words, key=lambda source: -token_overlap(words, source[1]))
+            hints[claim_id] = [index for index, _ in ranked[:2]]
+        return {"claims": claims, "likely_relevant_passage_ids": hints, "passages": sources}
+
+    def assess(
+        self, claims: dict[str, str], passages: list[str], run: ModelRun
+    ) -> tuple[dict[str, Claim], dict[str, str]]:
+        batch = self.passage_inputs(claims, passages)
+        prompt = VERIFY_PROMPT + "\n\nInput JSON:\n" + json.dumps(batch, ensure_ascii=False)
+        payload = self.client.generate(prompt, indexed_schema(list(claims), Assessment.model_json_schema()), run)
+        if isinstance(payload, dict):
+            run.raw_quotes = count_raw_quotes({"claims": list(payload.values())}, passages)
+        return check_assessments(payload, claims, passages)
 
     def repair(
         self, claims: dict[str, str], passages: list[str], issues: dict[str, str], run: ModelRun

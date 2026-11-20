@@ -5,11 +5,52 @@ from pathlib import Path
 from time import perf_counter
 
 from baselines import LexicalBaseline, OllamaBaseline
+from fourth import FourthVerifier
 from ollama_client import DEFAULT_OLLAMA_URL, DEFAULT_TIMEOUT, ModelRun, OllamaClient
 from optimized import OptimizedVerifier
-from scoring import align_claims, covers_evidence, summarize
+from retrieval import DEFAULT_EMBED_MODEL, OllamaEmbeddings, SentenceRetriever
+from scoring import align_claims, covers_evidence, covers_evidence_set, summarize
 from validate_dataset import EvaluationCase, read_cases
-from verifier import InvalidModelOutput, ModelError, VerificationModel, count_raw_quotes, validate_report
+from verifier import Citation, Claim, InvalidModelOutput, ModelError, VerificationModel, count_raw_quotes, validate_report
+
+
+def score_claims(
+    case: EvaluationCase, predicted: list[Claim], *,
+    retrieved: dict[str, list[Citation]] | None, status: str, semantic: bool = False,
+) -> dict:
+    gold = case.expected_claims
+    matches = []
+    answer = case.request.generated_answer if semantic else None
+    for gold_index, pred_index, similarity in align_claims(gold, predicted, answer=answer):
+        expected, actual = gold[gold_index], predicted[pred_index]
+        candidates = retrieved.get(str(pred_index)) if retrieved is not None else None
+        matches.append({
+            "expected_index": gold_index,
+            "predicted_index": pred_index,
+            "text_overlap": similarity,
+            "expected_verdict": expected.verdict,
+            "predicted_verdict": actual.verdict,
+            "verdict_correct": expected.verdict == actual.verdict,
+            "evidence_covered": covers_evidence(expected, actual) if expected.evidence_sets else None,
+            "citation_set_complete": covers_evidence_set(expected, actual.citations) if expected.evidence_sets else None,
+            "evidence_retrieved": covers_evidence_set(expected, candidates)
+            if expected.evidence_sets and candidates is not None else None,
+        })
+    return {"matches": matches, "case_correct": (
+        status == "ok"
+        and len(matches) == len(gold) == len(predicted)
+        and all(match["verdict_correct"] and match["evidence_covered"] is not False for match in matches)
+    )}
+
+
+def rescore_alignment(case: EvaluationCase, row: dict) -> dict:
+    if row["status"] != "ok":
+        return row
+    prediction = validate_report(row["prediction"], case.request.context_passages)
+    retrieved = row["retrieved_evidence"]
+    evidence = {key: [Citation.model_validate(item) for item in items]
+                for key, items in retrieved.items()} if retrieved is not None else None
+    return {**row, **score_claims(case, prediction.claims, retrieved=evidence, status=row["status"], semantic=True)}
 
 
 def evaluate_case(case: EvaluationCase, model: VerificationModel) -> dict:
@@ -34,26 +75,6 @@ def evaluate_case(case: EvaluationCase, model: VerificationModel) -> dict:
     if run.raw_quotes is not None:
         quotes_valid, quotes_total = run.raw_quotes
 
-    gold = case.expected_claims
-    predicted = report.claims if report is not None else []
-    matches = []
-    for gold_index, pred_index, similarity in align_claims(gold, predicted):
-        expected, actual = gold[gold_index], predicted[pred_index]
-        matches.append({
-            "expected_index": gold_index,
-            "predicted_index": pred_index,
-            "text_overlap": similarity,
-            "expected_verdict": expected.verdict,
-            "predicted_verdict": actual.verdict,
-            "verdict_correct": expected.verdict == actual.verdict,
-            "evidence_covered": covers_evidence(expected, actual) if expected.evidence_sets else None,
-        })
-    case_correct = (
-        status == "ok"
-        and len(matches) == len(gold) == len(predicted)
-        and all(match["verdict_correct"] and match["evidence_covered"] is not False for match in matches)
-    )
-
     return {
         "id": case.id,
         "category": case.category,
@@ -65,10 +86,15 @@ def evaluate_case(case: EvaluationCase, model: VerificationModel) -> dict:
         "repair_attempted": run.repair_attempted,
         "repair_succeeded": run.repair_succeeded,
         "raw_quotes": {"valid": quotes_valid, "total": quotes_total},
-        "expected_claims": [claim.model_dump() for claim in gold],
+        "retrieved_evidence": {
+            key: [citation.model_dump() for citation in value]
+            for key, value in run.retrieved_evidence.items()
+        } if run.retrieved_evidence is not None else None,
+        "postprocess_events": run.postprocess_events,
+        "expected_claims": [claim.model_dump() for claim in case.expected_claims],
         "prediction": report.model_dump() if report is not None else None,
-        "matches": matches,
-        "case_correct": case_correct,
+        **score_claims(case, report.claims if report is not None else [],
+                       retrieved=run.retrieved_evidence, status=status),
     }
 
 
@@ -76,9 +102,10 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Compare grounding verifiers on the labeled dataset.")
     parser.add_argument("--split", choices=("dev", "holdout"), default="dev")
     parser.add_argument(
-        "--method", choices=("lexical", "llm", "optimized", "baselines", "all"), default="lexical"
+        "--method", choices=("lexical", "llm", "optimized", "fourth", "baselines", "all"), default="lexical"
     )
     parser.add_argument("--model", help="Ollama model tag, required for methods that call Ollama")
+    parser.add_argument("--embed-model", default=DEFAULT_EMBED_MODEL, help="Embedding model for fourth")
     parser.add_argument("--ollama-url", default=DEFAULT_OLLAMA_URL)
     parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT, help="Ollama socket timeout in seconds")
     parser.add_argument("--output", type=Path, help="Write JSON summaries and per-case diagnostics")
@@ -99,8 +126,14 @@ def main() -> None:
     if args.method in {"optimized", "all"}:
         client = OllamaClient(args.model, args.ollama_url, args.timeout)
         methods["optimized"] = OptimizedVerifier(client)
+    if args.method == "fourth":
+        client = OllamaClient(args.model, args.ollama_url, args.timeout)
+        retriever = SentenceRetriever(OllamaEmbeddings(args.embed_model, args.ollama_url, args.timeout))
+        methods["fourth"] = FourthVerifier(client, retriever)
 
     evaluation = {"split": args.split, "llm_model": args.model if args.method != "lexical" else None, "methods": {}}
+    if args.method == "fourth":
+        evaluation["embed_model"] = args.embed_model
     for name, model in methods.items():
         rows = [evaluate_case(case, model) for case in cases]
         metrics = summarize(rows)

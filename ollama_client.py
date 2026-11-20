@@ -4,11 +4,34 @@ from dataclasses import dataclass, field
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-from verifier import InvalidModelOutput, ModelError
+from verifier import Citation, InvalidModelOutput, ModelError
 
 
 DEFAULT_OLLAMA_URL = "http://127.0.0.1:11434"
 DEFAULT_TIMEOUT = 60
+
+
+def post_json(url: str, body: dict, timeout: float) -> dict:
+    request = Request(url, data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
+    try:
+        with urlopen(request, timeout=timeout) as response:
+            result = json.load(response)
+    except HTTPError as error:
+        error.close()
+        raise ModelError(f"Ollama returned HTTP {error.code}") from error
+    except URLError as error:
+        if isinstance(error.reason, TimeoutError):
+            raise TimeoutError("Ollama request timed out") from error
+        raise ModelError(f"Ollama connection failed: {error.reason}") from error
+    except TimeoutError:
+        raise
+    except OSError as error:
+        raise ModelError(f"Ollama transport failed: {error}") from error
+    except (UnicodeError, ValueError) as error:
+        raise InvalidModelOutput("Ollama response is not valid JSON") from error
+    if not isinstance(result, dict):
+        raise InvalidModelOutput("Ollama response must be a JSON object")
+    return result
 
 
 @dataclass
@@ -18,6 +41,8 @@ class ModelRun:
     raw_quotes: tuple[int, int] | None = None
     repair_attempted: bool = False
     repair_succeeded: bool = False
+    retrieved_evidence: dict[str, list[Citation]] | None = None
+    postprocess_events: list[dict] = field(default_factory=list)
 
 
 class OllamaClient:
@@ -45,29 +70,8 @@ class OllamaClient:
             "format": schema,
             "options": {"temperature": 0, "seed": 0, "num_predict": 2048},
         }
-        request = Request(
-            self.url, data=json.dumps(body).encode(), headers={"Content-Type": "application/json"}
-        )
         run.calls += 1
-        try:
-            with urlopen(request, timeout=self.timeout) as response:
-                result = json.load(response)
-        except HTTPError as error:
-            error.close()
-            raise ModelError(f"Ollama returned HTTP {error.code}") from error
-        except URLError as error:
-            if isinstance(error.reason, TimeoutError):
-                raise TimeoutError("Ollama request timed out") from error
-            raise ModelError(f"Ollama connection failed: {error.reason}") from error
-        except TimeoutError:
-            raise
-        except OSError as error:
-            raise ModelError(f"Ollama transport failed: {error}") from error
-        except (UnicodeError, ValueError) as error:
-            raise InvalidModelOutput("Ollama response is not valid JSON") from error
-
-        if not isinstance(result, dict):
-            raise InvalidModelOutput("Ollama response must be a JSON object")
+        result = post_json(self.url, body, self.timeout)
         for field, api_field in (("prompt_tokens", "prompt_eval_count"), ("completion_tokens", "eval_count")):
             value = result.get(api_field)
             if type(value) is int and value >= 0:

@@ -2,11 +2,11 @@ import json
 import unittest
 from copy import deepcopy
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from fastapi.testclient import TestClient
 
-from app import app, create_app
+from app import app, create_app, create_submission_app
 from verifier import ModelError
 
 
@@ -38,6 +38,20 @@ class VerifyTests(unittest.TestCase):
             [claim["verdict"] for claim in response.json()["claims"]],
             ["CONTRADICTED", "SUPPORTED", "SUPPORTED", "UNSUPPORTED"],
         )
+
+    def test_submission_factory_verifies_requests_with_the_frozen_pipeline(self) -> None:
+        with (
+            patch.dict("os.environ", {"GROUNDING_MODEL": "test", "GROUNDING_EMBED_MODEL": "test-embed",
+                                      "GROUNDING_OLLAMA_URL": "http://127.0.0.1:11437"}),
+            patch("app.FactEvidenceVerifier", return_value=self.model) as factory,
+            TestClient(create_submission_app()) as client,
+        ):
+            response = client.post("/verify", json=self.request)
+        llm, retriever = factory.call_args.args
+        self.assertEqual(llm.model, "test")
+        self.assertEqual(retriever.embeddings.model, "test-embed")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), self.payload)
 
     def test_rejects_invalid_passage_indices(self) -> None:
         citation = self.payload["claims"][0]["citations"][0]

@@ -3,8 +3,10 @@ import os
 from fastapi import FastAPI, HTTPException
 
 from demo_model import AssignmentDemoModel
+from fact_evidence import FactEvidenceVerifier
 from ollama_client import DEFAULT_OLLAMA_URL, DEFAULT_TIMEOUT, OllamaClient
 from optimized import OptimizedVerifier
+from retrieval import DEFAULT_EMBED_MODEL, OllamaEmbeddings, SentenceRetriever
 from verifier import (
     InvalidModelOutput,
     ModelError,
@@ -43,12 +45,24 @@ def create_app(model: VerificationModel) -> FastAPI:
     return api
 
 
-def create_optimized_app() -> FastAPI:
+def configured_client() -> OllamaClient:
     model = os.environ.get("GROUNDING_MODEL")
     if not model:
         raise RuntimeError("Set GROUNDING_MODEL to an installed Ollama model tag")
     base_url = os.environ.get("GROUNDING_OLLAMA_URL", DEFAULT_OLLAMA_URL)
-    return create_app(OptimizedVerifier(OllamaClient(model, base_url, DEFAULT_TIMEOUT)))
+    return OllamaClient(model, base_url, DEFAULT_TIMEOUT)
+
+
+def create_optimized_app() -> FastAPI:
+    return create_app(OptimizedVerifier(configured_client()))
+
+
+def create_submission_app() -> FastAPI:
+    client = configured_client()
+    base_url = os.environ.get("GROUNDING_OLLAMA_URL", DEFAULT_OLLAMA_URL)
+    embed_model = os.environ.get("GROUNDING_EMBED_MODEL", DEFAULT_EMBED_MODEL)
+    retriever = SentenceRetriever(OllamaEmbeddings(embed_model, base_url, client.timeout))
+    return create_app(FactEvidenceVerifier(client, retriever))
 
 
 app = create_app(AssignmentDemoModel())

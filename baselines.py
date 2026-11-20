@@ -80,8 +80,8 @@ class LexicalBaseline:
 
 
 class OllamaBaseline:
-    def __init__(self, model: str, base_url: str, timeout: float) -> None:
-        self.client = OllamaClient(model, base_url, timeout)
+    def __init__(self, model: str, base_url: str, timeout: float, *, client: OllamaClient | None = None) -> None:
+        self.client = client or OllamaClient(model, base_url, timeout)
         self.schema = VerificationReport.model_json_schema()
 
     @property
